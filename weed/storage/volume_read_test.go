@@ -322,3 +322,46 @@ func TestReadNeedleDataIntoChecksumMismatchHoldsLastPage(t *testing.T) {
 		})
 	}
 }
+
+func TestReadVolumeFileNeedle(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	type written struct {
+		n      *needle.Needle
+		offset int64
+		size   types.Size
+	}
+	var needles []written
+	for i := 1; i <= 5; i++ {
+		n := newRandomNeedle(uint64(i))
+		n.Cookie = types.Cookie(i * 7)
+		offset, _, _, err := v.writeNeedle2(n, true, false, false)
+		if err != nil {
+			t.Fatalf("write needle %d: %v", i, err)
+		}
+		// The index records the needle's own size, which Append has now set.
+		needles = append(needles, written{n, int64(offset), n.Size})
+	}
+	v.Close()
+
+	// Out of order: each read stands on its own offset.
+	for _, i := range []int{3, 0, 4} {
+		w := needles[i]
+		got, err := ReadVolumeFileNeedle(dir, "", 1, NeedleMapInMemory, w.offset, w.size)
+		if err != nil {
+			t.Fatalf("read needle %d: %v", i+1, err)
+		}
+		if got.Id != w.n.Id || got.Cookie != w.n.Cookie || !bytes.Equal(got.Data, w.n.Data) {
+			t.Errorf("needle %d: read id %v cookie %v, %d bytes", i+1, got.Id, got.Cookie, len(got.Data))
+		}
+	}
+
+	// An offset that is not the start of that needle is an error, not other bytes.
+	if _, err := ReadVolumeFileNeedle(dir, "", 1, NeedleMapInMemory, needles[1].offset, needles[0].size+1); err == nil {
+		t.Errorf("reading with the wrong size: want an error")
+	}
+}

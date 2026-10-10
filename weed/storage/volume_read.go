@@ -326,6 +326,23 @@ func ScanVolumeFile(dirname string, collection string, id needle.VolumeId,
 	return ScanVolumeFileFrom(version, v.DataBackend, offset, volumeFileScanner)
 }
 
+// ReadVolumeFileNeedle reads the one needle at offset, the offset and size
+// being those of its index entry, without scanning the volume file.
+func ReadVolumeFileNeedle(dirname string, collection string, id needle.VolumeId,
+	needleMapKind NeedleMapKind, offset int64, size Size) (n *needle.Needle, err error) {
+	var v *Volume
+	if v, err = loadVolumeWithoutIndex(dirname, collection, id, needleMapKind, needle.GetCurrentVersion()); err != nil {
+		return nil, fmt.Errorf("failed to load volume %d: %w", id, err)
+	}
+	defer v.Close()
+
+	n = new(needle.Needle)
+	if err = n.ReadData(v.DataBackend, offset, size, v.Version()); err != nil {
+		return nil, fmt.Errorf("cannot read %s at offset %d: %w", v.DataBackend.Name(), offset, err)
+	}
+	return n, nil
+}
+
 func ScanVolumeFileFrom(version needle.Version, datBackend backend.BackendStorageFile, offset int64, volumeFileScanner VolumeFileScanner) (err error) {
 	n, nh, rest, e := needle.ReadNeedleHeader(datBackend, version, offset)
 	if e != nil {

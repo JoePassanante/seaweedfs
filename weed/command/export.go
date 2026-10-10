@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"path"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 const (
 	defaultFnFormat = `{{.Id}}_{{.Name}}{{.Ext}}`
 	timeFormat      = "2006-01-02T15:04:05"
+	listHeader      = "key\tname\tsize\tgzip\tmime\tmodified\tttl\tdeleted\tstart\tstop\n"
 )
 
 var (
@@ -44,6 +46,14 @@ var cmdExport = &Command{
 
 	The format of file name in the tar file can be customized. Default is {{.Mime}}/{{.Id}}:{{.Name}}. Also available is {{.Key}}.
 
+	With -fid, only that file is exported. It is read at the offset recorded in the .idx file, without
+	scanning the volume, and its content is written to the file -o names:
+
+		weed export -dir=/tmp -fid=234,01637037d6 -o=/dir/name.jpg
+
+	Without -o it is written to the current directory, named after the file id, e.g. 234,01637037d6.jpg.
+	An -o ending with .tar still writes a tar file, holding the one file.
+
   `,
 }
 
@@ -60,6 +70,7 @@ var (
 	newer       = cmdExport.Flag.String("newer", "", "export only files newer than this time, default is all files. Must be specified in RFC3339 without timezone, e.g. 2006-01-02T15:04:05")
 	showDeleted = cmdExport.Flag.Bool("deleted", false, "export deleted files. only applies if -o is not specified")
 	limit       = cmdExport.Flag.Int("limit", 0, "only show first n entries if specified")
+	exportFid   = cmdExport.Flag.String("fid", "", "export only this file id, e.g. 234,01637037d6. The output -o is the file content, or \"-\" for stdout, unless it ends with .tar. Default is the file id with the file's extension")
 
 	tarOutputFile          *tar.Writer
 	tarHeader              tar.Header
@@ -161,11 +172,26 @@ func runExport(cmd *Command, args []string) bool {
 		newerThanUnix = newerThan.Unix()
 	}
 
+	var fileId *needle.FileId
+	if *exportFid != "" {
+		if fileId, err = needle.ParseFileIdFromString(*exportFid); err != nil {
+			fmt.Println("cannot parse 'fid' argument: " + err.Error())
+			return false
+		}
+		if *export.volumeId == -1 {
+			*export.volumeId = int(fileId.VolumeId)
+		} else if *export.volumeId != int(fileId.VolumeId) {
+			fmt.Printf("fid %s is not in volume %d\n", *exportFid, *export.volumeId)
+			return false
+		}
+	}
+
 	if *export.volumeId == -1 {
 		return false
 	}
 
-	if *output != "" {
+	// One file is written as its content, unless a tar file is asked for.
+	if *output != "" && (fileId == nil || strings.HasSuffix(*output, ".tar")) {
 		if *output != "-" && !strings.HasSuffix(*output, ".tar") {
 			fmt.Println("the output file", *output, "should be '-' or end with .tar")
 			return false
@@ -203,8 +229,22 @@ func runExport(cmd *Command, args []string) bool {
 	needleMap := needle_map.NewMemDb()
 	defer needleMap.Close()
 
-	if err := needleMap.LoadFromIdx(path.Join(*export.dir, fileName+".idx")); err != nil {
+	// LoadFromIdx takes an index file it cannot open for an empty one, which
+	// lists or exports nothing.
+	idxFileName := path.Join(*export.dir, fileName+".idx")
+	if _, err := os.Stat(idxFileName); err != nil {
+		glog.Fatalf("cannot load needle map from %s.idx: %s. Run \"weed fix\" to recreate a missing index file", fileName, err)
+	}
+	if err := needleMap.LoadFromIdx(idxFileName); err != nil {
 		glog.Fatalf("cannot load needle map from %s.idx: %s", fileName, err)
+	}
+
+	if fileId != nil {
+		if err := exportOneFile(fileId, needleMap); err != nil {
+			fmt.Fprintf(os.Stderr, "cannot export %s: %s\n", fileId, err)
+			SetCommandExitStatus(1)
+		}
+		return true
 	}
 
 	volumeFileScanner := &VolumeFileScanner4Export{
@@ -213,7 +253,7 @@ func runExport(cmd *Command, args []string) bool {
 	}
 
 	if tarOutputFile == nil {
-		fmt.Printf("key\tname\tsize\tgzip\tmime\tmodified\tttl\tdeleted\tstart\tstop\n")
+		fmt.Print(listHeader)
 	}
 
 	err = storage.ScanVolumeFile(*export.dir, *export.collection, vid, storage.NeedleMapInMemory, volumeFileScanner)
@@ -221,6 +261,68 @@ func runExport(cmd *Command, args []string) bool {
 		glog.Errorf("Export Volume File [ERROR] %s\n", err)
 	}
 	return true
+}
+
+// exportOneFile exports the file its index entry points at, without scanning
+// the volume file.
+func exportOneFile(fileId *needle.FileId, needleMap *needle_map.MemDb) error {
+	nv, ok := needleMap.Get(fileId.Key)
+	if !ok || !nv.Size.IsValid() {
+		return fmt.Errorf("not in the index, or deleted")
+	}
+	offset := nv.Offset.ToActualOffset()
+	n, err := storage.ReadVolumeFileNeedle(*export.dir, *export.collection, fileId.VolumeId, storage.NeedleMapInMemory, offset, nv.Size)
+	if err != nil {
+		return err
+	}
+	if n.Id != fileId.Key || n.Cookie != fileId.Cookie {
+		return fmt.Errorf("found %s at offset %d", needle.NewFileIdFromNeedle(fileId.VolumeId, n), offset)
+	}
+
+	if tarOutputFile != nil {
+		return writeFile(fileId.VolumeId, n)
+	}
+
+	data := n.Data
+	if n.IsCompressed() && util.IsGzippedContent(data) {
+		if data, err = util.DecompressData(data); err != nil {
+			return err
+		}
+	}
+	if *output == "-" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	fileName := *output
+	if fileName == "" {
+		fileName = fileId.String() + needleExt(n)
+	}
+	if err = os.WriteFile(fileName, data, 0644); err != nil {
+		return err
+	}
+	// As in a tar file, the file is as old as the one that was stored.
+	if n.HasLastModifiedDate() {
+		modTime := time.Unix(int64(n.LastModified), 0)
+		if err = os.Chtimes(fileName, modTime, modTime); err != nil {
+			return err
+		}
+	}
+	if *output == "" {
+		fmt.Println(fileName)
+	}
+	return nil
+}
+
+// needleExt is the extension of the name the file was stored under, or else
+// one for its mime type.
+func needleExt(n *needle.Needle) string {
+	if ext := filepath.Ext(string(n.Name)); ext != "" {
+		return ext
+	}
+	if exts, _ := mime.ExtensionsByType(string(n.Mime)); len(exts) > 0 {
+		return exts[0]
+	}
+	return ""
 }
 
 type nameParams struct {
