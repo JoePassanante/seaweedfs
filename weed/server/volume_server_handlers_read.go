@@ -308,13 +308,15 @@ func shouldAttemptStreamWrite(hasLocalVolume bool, ext string, r *http.Request) 
 	if len(ext) > 0 {
 		ext = strings.ToLower(ext)
 	}
-	if r.Method == http.MethodHead {
-		return true, true
-	}
+	// A resized or cropped image is built from the needle's data, and a HEAD
+	// answers with that image's Content-Length, so it needs the data as well.
 	_, _, _, shouldResize := shouldResizeImages(ext, r)
 	_, _, _, _, shouldCrop := shouldCropImages(ext, r)
 	if shouldResize || shouldCrop {
 		return false, false
+	}
+	if r.Method == http.MethodHead {
+		return true, true
 	}
 	return true, false
 }
